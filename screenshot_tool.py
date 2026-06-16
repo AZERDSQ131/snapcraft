@@ -2,20 +2,20 @@
 import os
 import sys
 import select
+import socket
 import subprocess
 import threading
 import traceback
-import json
 from datetime import datetime
 
 import Quartz
 from ApplicationServices import AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt
 
-LOG_FILE  = "/tmp/screenshot_tool.log"
-KEYCODE_X = 7
-CTRL  = Quartz.kCGEventFlagMaskControl
-SHIFT = Quartz.kCGEventFlagMaskShift
-PID_FILE = "/tmp/screenshot_tool.pid"
+LOG_FILE     = "/tmp/screenshot_tool.log"
+KEYCODE_X    = 7
+CTRL         = Quartz.kCGEventFlagMaskControl
+SHIFT        = Quartz.kCGEventFlagMaskShift
+EDITOR_SOCK  = "/tmp/screenshot_editor.sock"
 
 
 def log(msg):
@@ -34,11 +34,23 @@ def take_screenshot():
     )
     if proc.returncode == 0 and os.path.exists(path):
         log(f"capture saved: {path}")
+        _open_editor(path)
+    else:
+        log("capture cancelled")
+
+
+def _open_editor(path):
+    """Envoie le path au serveur éditeur pré-chargé, sinon lance un nouveau processus."""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(1.0)
+        s.connect(EDITOR_SOCK)
+        s.send(path.encode())
+        s.close()
+    except Exception:
         python_bin = sys.executable
         editor = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'editor.py')
         subprocess.Popen([python_bin, editor, path])
-    else:
-        log("capture cancelled")
 
 
 def event_tap_loop(write_fd):
@@ -122,6 +134,11 @@ def run():
 
     t = threading.Thread(target=event_tap_loop, args=(write_fd,), daemon=True)
     t.start()
+
+    # Pré-charger l'éditeur en arrière-plan pour une ouverture instantanée
+    python_bin = sys.executable
+    editor = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'editor.py')
+    subprocess.Popen([python_bin, editor, '--server'])
 
     log("ready — Ctrl+Shift+X")
 
