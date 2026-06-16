@@ -1,382 +1,300 @@
-import math
+#!/usr/bin/env python3
+"""Éditeur d'annotation pour screenshots."""
+import sys
 import os
-from datetime import datetime
-from typing import Optional
+import math
+import subprocess
+import tempfile
 
-from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QApplication, QInputDialog, QScrollArea, QLabel
+import objc
+from AppKit import (
+    NSApplication, NSApp, NSWindow, NSView, NSButton, NSColor,
+    NSBezierPath, NSImage, NSTextField, NSFont,
+    NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
+    NSWindowStyleMaskMiniaturizable, NSBackingStoreBuffered,
+    NSApplicationActivationPolicyRegular,
+    NSSegmentedControl, NSSegmentStyleRounded,
 )
-from PyQt6.QtCore import Qt, QPoint, QRect, QPointF
-from PyQt6.QtGui import (
-    QPainter, QColor, QPixmap, QPen, QFont, QPolygonF,
-    QCursor, QKeySequence
-)
+from Foundation import NSObject, NSMakeRect, NSMakePoint
+
+IMAGE_PATH = sys.argv[1] if len(sys.argv) > 1 else None
+
+TOOL_RECT  = 0
+TOOL_ARROW = 1
+TOOL_TEXT  = 2
+
+RED = NSColor.colorWithRed_green_blue_alpha_(0.9, 0.1, 0.1, 1.0)
 
 
-RED = QColor(220, 38, 38)
-PEN_WIDTH = 2
+class Annotation:
+    def __init__(self, kind, p1, p2, text=""):
+        self.kind = kind
+        self.p1   = p1
+        self.p2   = p2
+        self.text = text
 
 
-class AnnotationCanvas(QWidget):
-    def __init__(self, pixmap: QPixmap):
-        super().__init__()
-        self._bg = pixmap
-        self._shapes: list[dict] = []
-        self._tool = 'rect'
-        self._color = QColor(RED)
+def draw_arrow(path, x1, y1, x2, y2):
+    path.moveToPoint_(NSMakePoint(x1, y1))
+    path.lineToPoint_(NSMakePoint(x2, y2))
+    angle = math.atan2(y2 - y1, x2 - x1)
+    L = 18
+    for sign in (+1, -1):
+        ax = x2 - L * math.cos(angle - sign * 0.45)
+        ay = y2 - L * math.sin(angle - sign * 0.45)
+        path.moveToPoint_(NSMakePoint(x2, y2))
+        path.lineToPoint_(NSMakePoint(ax, ay))
 
-        self._drawing = False
-        self._p0: Optional[QPoint] = None
-        self._p1: Optional[QPoint] = None
-        self._pencil_pts: list[QPoint] = []
 
-        logical_size = pixmap.size() / pixmap.devicePixelRatio()
-        self.setFixedSize(logical_size)
-        self.setMouseTracking(True)
+class CanvasView(NSView):
+    def initWithFrame_imagePath_(self, frame, image_path):
+        self = objc.super(CanvasView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._image_path  = image_path
+        # Chargement natif rapide — pas de conversion PIL au démarrage
+        self._ns_image    = NSImage.alloc().initWithContentsOfFile_(image_path)
+        self._annotations = []
+        self._current     = None
+        self._tool        = TOOL_RECT
+        self._drag_start  = None
+        self._text_field  = None
+        self._text_pos    = (0, 0)
+        return self
 
-    def set_tool(self, tool: str):
+    def isFlipped(self):
+        return True
+
+    def setTool_(self, tool):
         self._tool = tool
 
-    # ── paint ──────────────────────────────────────────────────────────────
+    def drawRect_(self, rect):
+        self._ns_image.drawInRect_(self.bounds())
+        RED.setStroke()
+        RED.setFill()
+        lw = 2.5
+        for ann in self._annotations:
+            self._draw_ann(ann, lw)
+        if self._current:
+            self._draw_ann(self._current, lw)
 
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.drawPixmap(self.rect(), self._bg, self.rect())
-        for shape in self._shapes:
-            self._draw_shape(p, shape)
-        self._draw_live(p)
+    def _draw_ann(self, ann, lw):
+        x1, y1 = ann.p1
+        x2, y2 = ann.p2
 
-    def _draw_live(self, p: QPainter):
-        if not self._drawing or self._p0 is None or self._p1 is None:
+        if ann.kind == TOOL_RECT:
+            path = NSBezierPath.bezierPathWithRect_(
+                NSMakeRect(min(x1,x2), min(y1,y2), abs(x2-x1), abs(y2-y1)))
+            path.setLineWidth_(lw)
+            path.stroke()
+
+        elif ann.kind == TOOL_ARROW:
+            path = NSBezierPath.bezierPath()
+            path.setLineWidth_(lw)
+            draw_arrow(path, x1, y1, x2, y2)
+            path.stroke()
+
+        elif ann.kind == TOOL_TEXT and ann.text:
+            from AppKit import NSString
+            NSString.stringWithString_(ann.text).drawAtPoint_withAttributes_(
+                NSMakePoint(x1, y1),
+                {"NSColor": RED, "NSFont": NSFont.boldSystemFontOfSize_(18)},
+            )
+
+    # ── Souris ────────────────────────────────────────────────────────────
+    def mouseDown_(self, event):
+        loc = self.convertPoint_fromView_(event.locationInWindow(), None)
+        self._drag_start = (loc.x, loc.y)
+        if self._tool == TOOL_TEXT:
+            self._begin_text_input(loc.x, loc.y)
+
+    def mouseDragged_(self, event):
+        if self._tool == TOOL_TEXT or self._drag_start is None:
             return
-        pen = QPen(self._color, PEN_WIDTH, Qt.PenStyle.SolidLine,
-                   Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
-        p.setPen(pen)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        if self._tool == 'rect':
-            p.drawRect(QRect(self._p0, self._p1).normalized())
-        elif self._tool == 'arrow':
-            _draw_arrow(p, self._p0, self._p1)
-        elif self._tool == 'pencil' and self._pencil_pts:
-            for i in range(1, len(self._pencil_pts)):
-                p.drawLine(self._pencil_pts[i - 1], self._pencil_pts[i])
+        loc = self.convertPoint_fromView_(event.locationInWindow(), None)
+        self._current = Annotation(self._tool, self._drag_start, (loc.x, loc.y))
+        self.setNeedsDisplay_(True)
 
-    def _draw_shape(self, p: QPainter, shape: dict):
-        color = shape.get('color', self._color)
-        pen = QPen(color, PEN_WIDTH, Qt.PenStyle.SolidLine,
-                   Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
-        p.setPen(pen)
-        p.setBrush(Qt.BrushStyle.NoBrush)
+    def mouseUp_(self, event):
+        if self._current:
+            self._annotations.append(self._current)
+            self._current = None
+            self.setNeedsDisplay_(True)
+        self._drag_start = None
 
-        t = shape['type']
-        if t == 'rect':
-            p.drawRect(shape['rect'])
-        elif t == 'arrow':
-            _draw_arrow(p, shape['start'], shape['end'])
-        elif t == 'pencil':
-            pts = shape['points']
-            for i in range(1, len(pts)):
-                p.drawLine(pts[i - 1], pts[i])
-        elif t == 'text':
-            p.setFont(QFont('.AppleSystemUIFont', 16, QFont.Weight.Bold))
-            p.drawText(shape['point'], shape['text'])
+    # ── Texte ─────────────────────────────────────────────────────────────
+    def _begin_text_input(self, x, y):
+        if self._text_field:
+            self.confirmText()
 
-    # ── mouse ──────────────────────────────────────────────────────────────
+        field = NSTextField.alloc().initWithFrame_(NSMakeRect(x, y, 220, 32))
+        field.setFont_(NSFont.boldSystemFontOfSize_(18))
+        field.setTextColor_(RED)
+        field.setDrawsBackground_(False)
+        field.setBordered_(True)
+        field.setStringValue_("")
+        field.setPlaceholderString_("Texte…")
+        # Entrée → confirmText
+        field.setTarget_(self)
+        field.setAction_("confirmText")
+        self.addSubview_(field)
+        self.window().makeFirstResponder_(field)
+        self._text_field = field
+        self._text_pos   = (x, y)
 
-    def mousePressEvent(self, event):
-        if event.button() != Qt.MouseButton.LeftButton:
+    def confirmText(self):
+        if not self._text_field:
             return
-        pos = event.position().toPoint()
+        text = self._text_field.stringValue()
+        if text:
+            self._annotations.append(
+                Annotation(TOOL_TEXT, self._text_pos, self._text_pos, text))
+        self._text_field.removeFromSuperview()
+        self._text_field = None
+        self.setNeedsDisplay_(True)
 
-        if self._tool == 'text':
-            text, ok = QInputDialog.getText(self, 'Texte', 'Entrez votre texte :')
-            if ok and text.strip():
-                self._shapes.append({'type': 'text', 'point': pos,
-                                     'text': text, 'color': QColor(self._color)})
-                self.update()
-            return
+    # ── Export ────────────────────────────────────────────────────────────
+    def _rendered_pil(self):
+        from PIL import Image, ImageDraw, ImageFont
+        img  = Image.open(self._image_path).convert("RGBA")
+        draw = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 24)
+        except Exception:
+            font = ImageFont.load_default()
+        fill = (230, 25, 25, 255)
+        lw   = 3
+        for ann in self._annotations:
+            x1, y1 = ann.p1
+            x2, y2 = ann.p2
+            if ann.kind == TOOL_RECT:
+                draw.rectangle([min(x1,x2), min(y1,y2), max(x1,x2), max(y1,y2)],
+                               outline=fill, width=lw)
+            elif ann.kind == TOOL_ARROW:
+                draw.line([x1, y1, x2, y2], fill=fill, width=lw)
+                angle = math.atan2(y2 - y1, x2 - x1)
+                L = 18
+                pts = [(x2, y2)]
+                for sign in (+1, -1):
+                    pts.append((x2 - L*math.cos(angle - sign*0.45),
+                                y2 - L*math.sin(angle - sign*0.45)))
+                draw.polygon(pts, fill=fill)
+            elif ann.kind == TOOL_TEXT and ann.text:
+                draw.text((x1, y1), ann.text, fill=fill, font=font)
+        return img.convert("RGB")
 
-        self._drawing = True
-        self._p0 = pos
-        self._p1 = pos
-        if self._tool == 'pencil':
-            self._pencil_pts = [pos]
+    @staticmethod
+    def _copy_to_clipboard(img):
+        tmp = tempfile.mktemp(suffix=".png")
+        img.save(tmp, "PNG")
+        subprocess.run([
+            "osascript", "-e",
+            f'set the clipboard to (read (POSIX file "{tmp}") as «class PNGf»)'
+        ])
+        os.unlink(tmp)
 
-    def mouseMoveEvent(self, event):
-        if not self._drawing:
-            return
-        self._p1 = event.position().toPoint()
-        if self._tool == 'pencil':
-            self._pencil_pts.append(self._p1)
-        self.update()
+    def action_copy_delete(self):
+        self.confirmText()
+        img = self._rendered_pil()
+        self._copy_to_clipboard(img)
+        if os.path.exists(self._image_path):
+            os.unlink(self._image_path)
+        NSApp.terminate_(None)
 
-    def mouseReleaseEvent(self, event):
-        if event.button() != Qt.MouseButton.LeftButton or not self._drawing:
-            return
-        self._drawing = False
-        pos = event.position().toPoint()
-        p0 = self._p0
+    def action_copy_save(self):
+        self.confirmText()
+        img = self._rendered_pil()
+        self._copy_to_clipboard(img)
+        img.save(self._image_path, "PNG")
+        NSApp.terminate_(None)
 
-        if self._tool == 'rect':
-            r = QRect(p0, pos).normalized()
-            if r.width() > 3 or r.height() > 3:
-                self._shapes.append({'type': 'rect', 'rect': r,
-                                     'color': QColor(self._color)})
-        elif self._tool == 'arrow':
-            if (pos - p0).manhattanLength() > 5:
-                self._shapes.append({'type': 'arrow', 'start': p0, 'end': pos,
-                                     'color': QColor(self._color)})
-        elif self._tool == 'pencil' and len(self._pencil_pts) > 1:
-            self._shapes.append({'type': 'pencil',
-                                 'points': list(self._pencil_pts),
-                                 'color': QColor(self._color)})
-            self._pencil_pts = []
-
-        self._p0 = self._p1 = None
-        self.update()
-
-    # ── actions ────────────────────────────────────────────────────────────
-
-    def undo(self):
-        if self._shapes:
-            self._shapes.pop()
-            self.update()
-
-    def render_result(self) -> QPixmap:
-        ratio = self._bg.devicePixelRatio()
-        result = QPixmap(self._bg.size())
-        result.fill(Qt.GlobalColor.transparent)
-        result.setDevicePixelRatio(ratio)
-        p = QPainter(result)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.drawPixmap(QPoint(0, 0), self._bg)
-        for shape in self._shapes:
-            s = dict(shape)
-            s_color = s.get('color', self._color)
-            pen = QPen(s_color, PEN_WIDTH, Qt.PenStyle.SolidLine,
-                       Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
-            p.setPen(pen)
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            t = s['type']
-            if t == 'rect':
-                p.drawRect(s['rect'])
-            elif t == 'arrow':
-                _draw_arrow(p, s['start'], s['end'])
-            elif t == 'pencil':
-                pts = s['points']
-                for i in range(1, len(pts)):
-                    p.drawLine(pts[i - 1], pts[i])
-            elif t == 'text':
-                p.setFont(QFont('.AppleSystemUIFont', 16, QFont.Weight.Bold))
-                p.drawText(s['point'], s['text'])
-        p.end()
-        return result
+    def action_save(self):
+        self.confirmText()
+        self._rendered_pil().save(self._image_path, "PNG")
+        NSApp.terminate_(None)
 
 
-def _draw_arrow(p: QPainter, start: QPoint, end: QPoint, head: int = 14):
-    p.drawLine(start, end)
-    dx = end.x() - start.x()
-    dy = end.y() - start.y()
-    length = math.hypot(dx, dy)
-    if length < 1:
-        return
-    angle = math.atan2(dy, dx)
-    p1 = QPointF(end.x() - head * math.cos(angle - math.pi / 6),
-                 end.y() - head * math.sin(angle - math.pi / 6))
-    p2 = QPointF(end.x() - head * math.cos(angle + math.pi / 6),
-                 end.y() - head * math.sin(angle + math.pi / 6))
-    poly = QPolygonF([QPointF(end), p1, p2])
-    p.setBrush(p.pen().color())
-    p.drawPolygon(poly)
-    p.setBrush(Qt.BrushStyle.NoBrush)
+class AppDelegate(NSObject):
+    def applicationDidFinishLaunching_(self, notification):
+        ns_img = NSImage.alloc().initWithContentsOfFile_(IMAGE_PATH)
+        sz     = ns_img.size()
+        W, H   = int(sz.width), int(sz.height)
+
+        TOOLBAR_H = 50
+        BUTTONS_H = 50
+        win_w = min(W, 1400)
+        win_h = min(H + TOOLBAR_H + BUTTONS_H, 1000)
+
+        self._window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(100, 100, win_w, win_h),
+            NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable,
+            NSBackingStoreBuffered,
+            False,
+        )
+        self._window.setTitle_("Screenshot Editor")
+        content  = self._window.contentView()
+
+        # ── Outils ────────────────────────────────────────────────────
+        seg = NSSegmentedControl.alloc().initWithFrame_(
+            NSMakeRect(8, win_h - TOOLBAR_H + 10, 260, 30))
+        seg.setSegmentCount_(3)
+        seg.setLabel_forSegment_("▭  Rectangle", 0)
+        seg.setLabel_forSegment_("➜  Flèche",    1)
+        seg.setLabel_forSegment_("T  Texte",      2)
+        seg.setSelectedSegment_(0)
+        seg.setSegmentStyle_(NSSegmentStyleRounded)
+        seg.setTarget_(self)
+        seg.setAction_("toolChanged:")
+        content.addSubview_(seg)
+        self._seg = seg
+
+        # ── Canvas ────────────────────────────────────────────────────
+        canvas_h = win_h - TOOLBAR_H - BUTTONS_H
+        self._canvas = CanvasView.alloc().initWithFrame_imagePath_(
+            NSMakeRect(0, BUTTONS_H, win_w, canvas_h), IMAGE_PATH)
+        content.addSubview_(self._canvas)
+
+        # ── Boutons ───────────────────────────────────────────────────
+        btn_w = win_w // 3
+        for i, (label, action) in enumerate([
+            ("Copier & Supprimer",  "btnCopyDelete:"),
+            ("Copier & Enregistrer","btnCopySave:"),
+            ("Enregistrer",         "btnSave:"),
+        ]):
+            btn = NSButton.alloc().initWithFrame_(
+                NSMakeRect(i * btn_w, 6, btn_w - 8, 38))
+            btn.setTitle_(label)
+            btn.setBezelStyle_(4)
+            btn.setTarget_(self)
+            btn.setAction_(action)
+            content.addSubview_(btn)
+
+        self._window.makeKeyAndOrderFront_(None)
+        NSApp.activateIgnoringOtherApps_(True)
+
+    def toolChanged_(self, sender):
+        self._canvas.setTool_(sender.selectedSegment())
+
+    def btnCopyDelete_(self, sender):
+        self._canvas.action_copy_delete()
+
+    def btnCopySave_(self, sender):
+        self._canvas.action_copy_save()
+
+    def btnSave_(self, sender):
+        self._canvas.action_save()
 
 
-# ── Editor window ──────────────────────────────────────────────────────────────
+def main():
+    if not IMAGE_PATH or not os.path.exists(IMAGE_PATH):
+        print("Usage: editor.py <image_path>")
+        sys.exit(1)
+    app = NSApplication.sharedApplication()
+    app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
+    delegate = AppDelegate.alloc().init()
+    app.setDelegate_(delegate)
+    app.run()
 
-DARK = "#1C1C1E"
-DARK2 = "#2C2C2E"
-DARK3 = "#3A3A3C"
-ACCENT = "#FF3B30"
-BLUE = "#007AFF"
 
-
-class EditorWindow(QWidget):
-    def __init__(self, pixmap: QPixmap):
-        super().__init__()
-        self.setWindowTitle("Annotation")
-        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint)
-
-        self._canvas = AnnotationCanvas(pixmap)
-        self._build_ui()
-        self._size_window(pixmap)
-        self.setStyleSheet(f"QWidget {{ background: {DARK}; color: white; "
-                           f"font-family: -apple-system; }}")
-
-    def _size_window(self, pixmap: QPixmap):
-        screen = QApplication.primaryScreen().availableGeometry()
-        img_w = int(pixmap.width() / pixmap.devicePixelRatio())
-        img_h = int(pixmap.height() / pixmap.devicePixelRatio())
-        w = min(img_w + 2, int(screen.width() * 0.92))
-        h = min(img_h + 96, int(screen.height() * 0.88))
-        self.resize(w, h)
-        self.move(screen.x() + (screen.width() - w) // 2,
-                  screen.y() + (screen.height() - h) // 2)
-
-    def _build_ui(self):
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
-        root.addWidget(self._make_toolbar())
-
-        scroll = QScrollArea()
-        scroll.setWidget(self._canvas)
-        scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        scroll.setStyleSheet(f"background: #141414; border: none;")
-        root.addWidget(scroll, 1)
-
-        root.addWidget(self._make_export_bar())
-
-    # ── toolbar ──────────────────────────────────────────────────────────
-
-    def _make_toolbar(self) -> QWidget:
-        bar = QWidget()
-        bar.setFixedHeight(50)
-        bar.setStyleSheet(f"background: {DARK2}; border-bottom: 1px solid {DARK3};")
-
-        layout = QHBoxLayout(bar)
-        layout.setContentsMargins(12, 0, 12, 0)
-        layout.setSpacing(4)
-
-        tools = [
-            ('rect',   '▭',  'Rectangle (R)'),
-            ('arrow',  '↗',  'Flèche (A)'),
-            ('text',   'T',  'Texte (T)'),
-            ('pencil', '✏',  'Crayon (P)'),
-        ]
-
-        self._tool_btns: dict[str, QPushButton] = {}
-        for tid, icon, tip in tools:
-            btn = QPushButton(icon)
-            btn.setToolTip(tip)
-            btn.setCheckable(True)
-            btn.setFixedSize(38, 34)
-            btn.setStyleSheet(self._tool_btn_style())
-            btn.clicked.connect(lambda _, t=tid: self._select_tool(t))
-            layout.addWidget(btn)
-            self._tool_btns[tid] = btn
-
-        self._tool_btns['rect'].setChecked(True)
-
-        layout.addStretch()
-
-        undo_btn = QPushButton("↩  Annuler")
-        undo_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent; color: #AEAEB2;
-                border: 1px solid {DARK3}; border-radius: 7px;
-                padding: 4px 12px; font-size: 13px;
-            }}
-            QPushButton:hover {{ color: white; background: {DARK3}; }}
-        """)
-        undo_btn.clicked.connect(self._canvas.undo)
-        layout.addWidget(undo_btn)
-
-        return bar
-
-    def _tool_btn_style(self) -> str:
-        return f"""
-            QPushButton {{
-                background: transparent; color: #AEAEB2;
-                border: 1px solid transparent; border-radius: 7px;
-                font-size: 17px;
-            }}
-            QPushButton:hover {{ background: {DARK3}; color: white; }}
-            QPushButton:checked {{ background: {ACCENT}; color: white; border-color: {ACCENT}; }}
-        """
-
-    def _select_tool(self, tool: str):
-        self._canvas.set_tool(tool)
-        for tid, btn in self._tool_btns.items():
-            btn.setChecked(tid == tool)
-
-    def keyPressEvent(self, event):
-        key = event.key()
-        if key == Qt.Key.Key_R:
-            self._select_tool('rect')
-        elif key == Qt.Key.Key_A:
-            self._select_tool('arrow')
-        elif key == Qt.Key.Key_T:
-            self._select_tool('text')
-        elif key == Qt.Key.Key_P:
-            self._select_tool('pencil')
-        elif key == Qt.Key.Key_Z and event.modifiers() & Qt.KeyboardModifier.MetaModifier:
-            self._canvas.undo()
-        elif key == Qt.Key.Key_Escape:
-            self.close()
-
-    # ── export bar ───────────────────────────────────────────────────────
-
-    def _make_export_bar(self) -> QWidget:
-        bar = QWidget()
-        bar.setFixedHeight(54)
-        bar.setStyleSheet(f"background: {DARK2}; border-top: 1px solid {DARK3};")
-
-        layout = QHBoxLayout(bar)
-        layout.setContentsMargins(12, 0, 12, 0)
-        layout.setSpacing(8)
-        layout.addStretch()
-
-        def ghost_btn(label: str) -> QPushButton:
-            b = QPushButton(label)
-            b.setStyleSheet(f"""
-                QPushButton {{
-                    background: {DARK3}; color: white;
-                    border: none; border-radius: 8px;
-                    padding: 7px 16px; font-size: 13px;
-                }}
-                QPushButton:hover {{ background: #48484A; }}
-            """)
-            return b
-
-        b1 = ghost_btn("📋  Copier & Fermer")
-        b2 = ghost_btn("📋  Copier & Enregistrer")
-        b3 = QPushButton("💾  Enregistrer")
-        b3.setStyleSheet(f"""
-            QPushButton {{
-                background: {BLUE}; color: white;
-                border: none; border-radius: 8px;
-                padding: 7px 16px; font-size: 13px;
-            }}
-            QPushButton:hover {{ background: #0A84FF; }}
-        """)
-
-        b1.clicked.connect(self._export_copy)
-        b2.clicked.connect(self._export_copy_save)
-        b3.clicked.connect(self._export_save)
-
-        for b in (b1, b2, b3):
-            layout.addWidget(b)
-
-        return bar
-
-    # ── export actions ───────────────────────────────────────────────────
-
-    def _desktop_path(self) -> str:
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        return os.path.expanduser(f'~/Desktop/capture_{ts}.png')
-
-    def _export_copy(self):
-        QApplication.clipboard().setPixmap(self._canvas.render_result())
-        self.close()
-
-    def _export_copy_save(self):
-        pix = self._canvas.render_result()
-        QApplication.clipboard().setPixmap(pix)
-        pix.save(self._desktop_path())
-        self.close()
-
-    def _export_save(self):
-        self._canvas.render_result().save(self._desktop_path())
-        self.close()
+if __name__ == "__main__":
+    main()
