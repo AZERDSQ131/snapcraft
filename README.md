@@ -1,98 +1,101 @@
 # snapcraft
 
-**macOS screenshot tool** — global hotkey, region selection, annotation editor.
+**macOS screenshot tool** — raccourci global, sélection de zone, éditeur d'annotation.
 
-Press `Ctrl + Shift + X` to summon the floating toolbar, capture the full screen or a custom region, then annotate with rectangles, arrows, text, or freehand drawing. Dark theme, Retina-ready.
+Appuie sur `Ctrl + Shift + X` pour déclencher la capture d'une région, puis annote avec des rectangles, flèches ou texte. Thème sombre, architecture native PyObjC.
 
-> ⚠️ **Early development** — this project is a work in progress. APIs and behavior may change.
+> ⚠️ **En cours de développement** — l'éditeur d'annotation est partiellement fonctionnel. L'affichage de l'image capturée dans le canvas est un bug connu non résolu (canvas noir malgré le chargement correct de l'image). Le raccourci, la capture et l'architecture socket pré-chargé fonctionnent correctement.
 
 ---
 
-## Features
+## Fonctionnalités
 
-- Global hotkey via Core Graphics event tap (`Ctrl + Shift + X`)
-- Full-screen capture
-- Interactive region selection with on-screen overlay
-- Annotation canvas (rectangles, arrows, text, pencil)
-- High-DPI / Retina support
-- Dark-themed flat UI
-- Clipboard copy and/or save to Desktop
+- Raccourci global via Core Graphics event tap (`Ctrl + Shift + X`)
+- Sélection de région interactive (`screencapture -i`)
+- Éditeur d'annotation natif PyObjC (rectangles, flèches, texte en rouge)
+- Undo/Redo (`Ctrl+Z` / `Ctrl+Shift+Z`)
+- Ouverture instantanée via serveur socket pré-chargé
+- Interface sombre sans barre de titre macOS
+- Export : copier dans le presse-papiers et/ou enregistrer en PNG
+- Bouton de fermeture (×) dans la toolbar
 
-## Requirements
+## Architecture
 
-| Dependency | Version |
+```
+screenshot_tool.py   — démon principal (event tap, LaunchAgent)
+editor.py            — éditeur d'annotation PyObjC (mode serveur ou standalone)
+requirements.txt     — dépendances pip
+```
+
+Le démon tourne en arrière-plan via un `LaunchAgent` et pré-charge l'éditeur via un socket Unix (`/tmp/screenshot_editor.sock`) pour une ouverture quasi-instantanée.
+
+## Prérequis
+
+| Dépendance | Version |
 |---|---|
 | macOS | 12+ |
-| Python | 3.9+ |
-| PyQt6 | ≥ 6.4.0 |
-| PyObjC (Quartz, ApplicationServices) | — |
+| Python | 3.12 (Homebrew, bundle Python.app) |
+| PyObjC | ≥ 10.0 |
+| Pillow | ≥ 10.0 |
 
-## Setup
+> **Important** : utiliser le bundle `Python.app` de Homebrew (pas `/usr/bin/python3`) pour pouvoir ajouter Python dans les permissions Accessibilité sans blocage SIP.
+
+## Installation
 
 ```bash
 pip install -r requirements.txt
+python3 screenshot_tool.py install
 ```
 
-### Accessibility permission
+### Permission Accessibilité
 
-The global hotkey requires Accessibility access:
+Le raccourci global requiert la permission Accessibilité :
 
-1. Open **System Settings → Privacy & Security → Accessibility**
-2. Add the Python interpreter that runs the script (`/usr/bin/python3` or your virtualenv's python)
-3. Restart the app
+1. Ouvrir **Réglages Système → Confidentialité et sécurité → Accessibilité**
+2. Ajouter le binaire Python.app de Homebrew :
+   `/opt/homebrew/Cellar/python@3.12/<version>/Frameworks/Python.framework/Versions/3.12/Resources/Python.app`
+3. Le LaunchAgent redémarre automatiquement
 
-## Usage
+## Utilisation
 
 ```bash
-python3 main.py
+# Installer le LaunchAgent (démarre automatiquement au login)
+python3 screenshot_tool.py install
+
+# Désinstaller
+python3 screenshot_tool.py uninstall
 ```
 
-A log file is written to `/tmp/screenshot_tool.log`.
+Logs : `/tmp/screenshot_tool.log`
 
-### Controls
+### Raccourcis dans l'éditeur
 
-| Action | Input |
+| Action | Raccourci |
 |---|---|
-| Show / hide toolbar | `Ctrl + Shift + X` |
-| Full-screen capture | Click **Plein écran** |
-| Region capture | Click **Sélection**, then drag on screen |
-| Cancel region selection | `Escape` |
+| Undo | `Ctrl + Z` |
+| Redo | `Ctrl + Shift + Z` |
+| Valider texte | `Entrée` |
+| Fermer | Bouton × (en haut à droite) |
 
-### Annotation tools
+### Boutons d'export
 
-| Tool | Shortcut |
+| Bouton | Action |
 |---|---|
-| Rectangle | `R` |
-| Arrow | `A` |
-| Text | `T` |
-| Pencil | `P` |
-| Undo | `Cmd + Z` |
+| Copier & Supprimer | Copie dans le presse-papiers, supprime le fichier PNG |
+| Copier & Enregistrer | Copie dans le presse-papiers + conserve le PNG |
+| Enregistrer | Enregistre le PNG sur le bureau |
 
-### Export
+## Bugs connus / En cours
 
-| Button | Action |
-|---|---|
-| Copier & Fermer | Copy annotated image to clipboard, close editor |
-| Copier & Enregistrer | Copy to clipboard + save PNG to Desktop |
-| Enregistrer | Save PNG to Desktop |
+- **Canvas noir** : `NSImage.drawInRect_`, `NSBitmapImageRep.drawInRect_` et `NSImageView` échouent tous silencieusement à afficher l'image dans la fenêtre borderless PyObjC. L'image se charge correctement (taille et objet valides), `drawRect_` est bien appelé, mais le rendu reste noir. Piste : Core Graphics / CALayer.
+- **Boutons d'action** : positionnement vertical à vérifier après résolution du bug canvas.
 
-## Troubleshooting
+## Dépannage
 
-- **Hotkey doesn't work** → check Accessibility permission and `/tmp/screenshot_tool.log`
-- **"CGEventTapCreate → None"** → the process doesn't have Accessibility permission
-- **Annotations look wrong on Retina** → ensure `PyQt6 ≥ 6.4.0`
+- **Le raccourci ne fonctionne pas** → vérifier la permission Accessibilité et `/tmp/screenshot_tool.log`
+- **`CGEventTapCreate → None`** → le processus n'a pas la permission Accessibilité
+- **`screencapture` introuvable** → vérifier que `/usr/sbin` est dans le PATH du LaunchAgent
 
-## Project structure
-
-```
-snapcraft/
-├── main.py          # App entry point, event tap, Qt loop
-├── capture.py       # Full-screen & region capture
-├── editor.py        # Annotation canvas & editor window
-├── toolbar.py       # Floating toolbar widget
-└── test_hotkey.py   # Standalone key event logger (debugging)
-```
-
-## License
+## Licence
 
 MIT

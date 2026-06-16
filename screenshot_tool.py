@@ -69,7 +69,6 @@ def event_tap_loop(write_fd):
                 flags   = Quartz.CGEventGetFlags(event)
                 keycode = Quartz.CGEventGetIntegerValueField(
                     event, Quartz.kCGKeyboardEventKeycode)
-                log(f"keydown: keycode={keycode} flags={flags:#010x}")
                 if (keycode == KEYCODE_X
                         and bool(flags & CTRL)
                         and bool(flags & SHIFT)
